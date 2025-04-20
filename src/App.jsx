@@ -3,42 +3,31 @@ import ChatbotIcon from './components/ChatbotIcon';
 import Chatform from './components/Chatform';
 import ChatMessage from './components/ChatMessage';
 import { companyInfo } from '../CompanyInfo';
-import { createClient } from '@deepgram/sdk';
-
-console.log('Env check Vite full:', import.meta.env);
-console.log('Env check Vite specific:', import.meta.env.VITE_API_URL, import.meta.env.VITE_DEEPGRAM_API_KEY, import.meta.env.VITE_GEMINI_API_KEY);
 
 const apiUrl = import.meta.env.VITE_API_URL;
 const API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const deepgramApiKey = import.meta.env.VITE_DEEPGRAM_API_KEY;
 
-console.log('API URL used:', apiUrl);
-console.log('API KEY used:', API_KEY);
-console.log('Deepgram API Key:', deepgramApiKey);
-try {
-  const deepgram = deepgramApiKey ? createClient({ apiKey: deepgramApiKey }) : null;
-  console.log('Deepgram initialized:', !!deepgram);
-} catch (error) {
-  console.error('Deepgram initialization failed:', error);
-  const deepgram = null;
-}
+console.log('Env check:', { apiUrl, API_KEY, deepgramApiKey });
 
 const App = () => {
   const [chatHistory, setChatHistory] = useState([
-    { hideInChat: true, role: 'model', text: companyInfo }
+    { hideInChat: true, role: 'model', text: companyInfo },
   ]);
   const [showChatbot, setShowChatbot] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const chatBodyRef = useRef(null);
   const recognitionRef = useRef(null);
+  const wsRef = useRef(null);
 
   const generateBotResponse = async (history) => {
-    const API_URL = `${apiUrl}&key=${API_KEY}`;
+    const hasQuery = apiUrl.includes('?');
+    const API_URL = hasQuery ? apiUrl : `${apiUrl}${API_KEY ? `?key=${API_KEY}` : ''}`;
     console.log('Fetching from:', API_URL);
     const updateHistory = (text, isError = false) => {
       setChatHistory((prev) => [
         ...prev.filter((msg) => msg.text !== 'Thinking...'),
-        { role: 'model', text, isError }
+        { role: 'model', text, isError },
       ]);
     };
 
@@ -55,22 +44,9 @@ const App = () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: history }),
       });
-
-      console.log('Response status:', response.status);
       const responseText = await response.text();
-      console.log('Response text:', responseText);
-
-      let data;
-      try {
-        data = responseText ? JSON.parse(responseText) : {};
-      } catch (jsonError) {
-        console.error('JSON parse error:', jsonError);
-        updateHistory('Invalid response from API.', true);
-        return;
-      }
-
+      let data = responseText ? JSON.parse(responseText) : {};
       if (!response.ok) throw new Error(data.error?.message || 'Something went wrong!');
-
       const apiResponseText = data.candidates?.[0]?.content?.parts?.[0]?.text?.replace(/\*\*(.*?)\*\*/g, '$1').trim();
       updateHistory(apiResponseText || 'No response received.');
     } catch (error) {
@@ -80,64 +56,91 @@ const App = () => {
   };
 
   const startVoiceSearch = () => {
-    if (isListening || !deepgram) {
-      setChatHistory((prev) => [...prev, { role: 'model', text: 'Voice search unavailable. Please check the Deepgram API key.', isError: true }]);
+    if (isListening || !deepgramApiKey) {
+      setChatHistory((prev) => [
+        ...prev,
+        { role: 'model', text: 'Voice search unavailable. Please check the Deepgram API key.', isError: true },
+      ]);
       return;
     }
 
     setIsListening(true);
     setChatHistory((prev) => [...prev, { role: 'model', text: 'Listening...' }]);
 
-    const recognition = deepgram.listen.live({
-      model: 'nova-2',
-      language: 'en-US',
-      interim_results: false,
-    });
+    const ws = new WebSocket(`wss://api.deepgram.com/v1/listen?encoding=linear16&sample_rate=16000&language=en-US&interim_results=false`, [
+      'token',
+      deepgramApiKey,
+    ]);
+    wsRef.current = ws;
 
-    recognitionRef.current = recognition;
+    ws.onopen = () => {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then((stream) => {
+          const mediaRecorder = new MediaRecorder(stream);
+          recognitionRef.current = mediaRecorder;
 
-    recognition.addListener('open', () => {
-      navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-        const audioTrack = stream.getAudioTracks()[0];
-        recognition.start(audioTrack);
-      }).catch((err) => {
-        setChatHistory((prev) => [...prev, { role: 'model', text: `Error: ${err.message}`, isError: true }]);
-        stopVoiceSearch();
-      });
-    });
+          mediaRecorder.ondataavailable = (event) => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(event.data);
+            }
+          };
 
-    recognition.addListener('transcriptReceived', (data) => {
-      if (data.isFinal) {
+          mediaRecorder.onstop = () => {
+            ws.close();
+            stream.getTracks().forEach((track) => track.stop());
+          };
+
+          mediaRecorder.start(250); // Send audio chunks every 250ms
+        })
+        .catch((err) => {
+          setChatHistory((prev) => [...prev, { role: 'model', text: `Error: ${err.message}`, isError: true }]);
+          stopVoiceSearch();
+        });
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.channel && data.channel.alternatives && data.channel.alternatives[0].transcript) {
         const transcript = data.channel.alternatives[0].transcript.trim();
-        if (transcript) {
+        if (transcript && data.is_final) {
           setChatHistory((prev) => [
             ...prev.filter((msg) => msg.text !== 'Listening...'),
-            { role: 'user', text: transcript }
+            { role: 'user', text: transcript },
           ]);
           setTimeout(() => {
             setChatHistory((prev) => [...prev, { role: 'model', text: 'Thinking...' }]);
             generateBotResponse([
               ...chatHistory.filter((msg) => msg.text !== 'Listening...'),
-              { role: 'user', text: `Using the details provided above, please address this query: ${transcript}` }
+              { role: 'user', text: `Using the details provided above, please address this query: ${transcript}` },
             ]);
           }, 500);
+          stopVoiceSearch();
         }
-        stopVoiceSearch();
       }
-    });
+    };
 
-    recognition.addListener('error', (error) => {
-      setChatHistory((prev) => [...prev, { role: 'model', text: `Error: ${error.message}`, isError: true }]);
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setChatHistory((prev) => [...prev, { role: 'model', text: 'Error: WebSocket connection failed.', isError: true }]);
       stopVoiceSearch();
-    });
+    };
+
+    ws.onclose = () => {
+      if (isListening) stopVoiceSearch();
+    };
   };
 
   const stopVoiceSearch = () => {
     if (recognitionRef.current && isListening) {
-      recognitionRef.current.finish();
-      setIsListening(false);
-      setChatHistory((prev) => prev.filter((msg) => msg.text !== 'Listening...'));
+      recognitionRef.current.stop();
+      recognitionRef.current = null;
     }
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setIsListening(false);
+    setChatHistory((prev) => prev.filter((msg) => msg.text !== 'Listening...'));
   };
 
   useEffect(() => {
@@ -148,9 +151,7 @@ const App = () => {
 
   useEffect(() => {
     return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.finish();
-      }
+      stopVoiceSearch();
     };
   }, []);
 
