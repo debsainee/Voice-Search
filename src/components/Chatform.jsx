@@ -24,7 +24,7 @@ const Chatform = ({ chatHistory, setChatHistory, generateBotResponse }) => {
         ...chatHistory,
         { role: "user", text: `Using the details provided above, please address this query: ${userMessage}` },
       ]);
-    }, 500); // Added a slight delay to simulate processing time
+    }, 500);
   };
 
   return (
@@ -36,9 +36,7 @@ const Chatform = ({ chatHistory, setChatHistory, generateBotResponse }) => {
         className="message-input"
         required
       />
-      <button type="submit">
-        <span className="material-symbols-outlined">send</span>
-      </button>
+      <button type="submit">➤</button>
     </form>
   );
 };
